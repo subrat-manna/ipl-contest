@@ -1,0 +1,1624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPL Daily Contest</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@400;500;600;700&family=Teko:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot,
+         collection, getDocs, query, orderBy, writeBatch, deleteDoc }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ─── FIREBASE CONFIG ───────────────────────────────────────────────────────
+const firebaseConfig = {
+  apiKey: "AIzaSyDxn6NJHiC-KET_k-Dy5inlLKzDldNCuEs",
+  authDomain: "ipl-contest-d496b.firebaseapp.com",
+  projectId: "ipl-contest-d496b",
+  storageBucket: "ipl-contest-d496b.firebasestorage.app",
+  messagingSenderId: "116370990418",
+  appId: "1:116370990418:web:d87223719d2db5d4fe868b"
+};
+const ADMIN_PASS = "ipl2024";
+
+// ─── FIRESTORE REFS ────────────────────────────────────────────────────────
+// currentMatch  → single doc: all match settings + active/winner state
+// currentMatch/players/{id} → live players for current match
+// history/{matchNumber} → one doc per match, overwritten when results updated
+const app = initializeApp(firebaseConfig);
+const db  = getFirestore(app);
+const matchDocRef  = doc(db, "currentMatch", "live");
+const playersColl  = collection(db, "currentMatch", "live", "players");
+const historyRef   = (matchNo) => doc(db, "history", String(matchNo));
+const historyQuery = query(collection(db, "history"), orderBy("matchNumber", "desc"));
+
+// ─── STATE ─────────────────────────────────────────────────────────────────
+let matchData   = null;   // live match doc
+let playersList = [];     // live players array
+let historyList = [];     // all history docs
+let currentUser = {};
+
+const cfg = () => matchData || {};
+const pts = () => playersList;
+
+// ─── BOOT ──────────────────────────────────────────────────────────────────
+async function boot() {
+  try {
+    // Create currentMatch doc if it doesn't exist
+    const snap = await getDoc(matchDocRef);
+    if (!snap.exists()) {
+      await setDoc(matchDocRef, {
+        matchNumber: 1, team1: "", team2: "", time: "",
+        fee: 50, maxSpots: 15, qr: "", upi: "", contest: "",
+        redirectDelay: 3, active: false, winner: ""
+      });
+    }
+
+    // Live listener — current match
+    onSnapshot(matchDocRef, s => {
+      matchData = s.data();
+      renderAll();
+    }, e => showToast("Match sync error: " + e.message, "#e63946"));
+
+    // Live listener — current players
+    onSnapshot(playersColl, s => {
+      playersList = s.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderAll();
+    }, e => showToast("Players sync error: " + e.message, "#e63946"));
+
+    // Live listener — history
+    onSnapshot(historyQuery, s => {
+      historyList = s.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderHistory();
+      renderAdminHistory();
+    }, e => console.error("History listener:", e));
+
+    hideLoader();
+  } catch(e) {
+    hideLoader();
+    document.getElementById("setup-banner").style.display = "block";
+    document.getElementById("setup-error").textContent = "Error: " + e.message;
+  }
+}
+
+function hideLoader() {
+  document.getElementById("app-loader").style.display = "none";
+  document.getElementById("page-home").classList.add("active");
+}
+
+// ─── NAVIGATION ────────────────────────────────────────────────────────────
+window.showPage = id => {
+  document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+  document.getElementById("page-" + id)?.classList.add("active");
+  window.scrollTo(0, 0);
+};
+window.goAdmin = () => { showPage("admin-login"); document.getElementById("admin-pass-input").value = ""; };
+window.checkAdmin = () => {
+  if (document.getElementById("admin-pass-input").value === ADMIN_PASS) { loadAdminFields(); showPage("admin"); }
+  else showToast("Incorrect password", "#e63946");
+};
+window.showResults = () => { confettiFired = false; renderResults(); renderHistory(); showPage("results"); switchTab("today"); };
+window.switchTab = tab => {
+  document.getElementById("results-today").style.display    = tab === "today"   ? "block" : "none";
+  document.getElementById("results-history").style.display  = tab === "history" ? "block" : "none";
+  document.getElementById("tab-today").classList.toggle("active",   tab === "today");
+  document.getElementById("tab-history").classList.toggle("active", tab === "history");
+};
+
+window.toggleFunny = () => {
+  document.getElementById("funny-toggle").classList.toggle("open");
+  document.getElementById("funny-fields").classList.toggle("open");
+};
+
+// ─── REGISTER FLOW ─────────────────────────────────────────────────────────
+window.goRegister = () => {
+  const c = cfg(), p = pts();
+  if (!c.active)           { showToast("Contest is currently closed.", "#e63946"); return; }
+  if (c.winner)            { showToast("Result already published. Contest is closed.", "#e63946"); return; }
+  if (p.length >= (c.maxSpots || 15)) { showToast("All spots filled!", "#e63946"); return; }
+  document.querySelector("#page-register .page-sub").textContent =
+    `Match #${c.matchNumber} · ${c.team1} vs ${c.team2} · ${c.time}`;
+  ["reg-name","reg-phone","reg-superstition","reg-snack","reg-spend","reg-prediction"]
+    .forEach(id => { const el = document.getElementById(id); if (el) el.value = ""; });
+  showPage("register");
+};
+
+window.goPayment = () => {
+  const c = cfg();
+  const name  = document.getElementById("reg-name").value.trim();
+  const phone = document.getElementById("reg-phone").value.trim();
+  if (!name) { showToast("Please enter your name", "#e63946"); return; }
+  if (phone && !/^\d{10}$/.test(phone)) { showToast("Enter valid 10-digit phone or leave blank", "#e63946"); return; }
+  currentUser = {
+    name, phone: phone || "—",
+    superstition: document.getElementById("reg-superstition").value.trim(),
+    snack:        document.getElementById("reg-snack").value.trim(),
+    spend:        document.getElementById("reg-spend").value.trim(),
+    prediction:   document.getElementById("reg-prediction").value.trim(),
+    joinedAt: Date.now(),
+    joined: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
+    match: `${c.team1} vs ${c.team2}`,
+    matchNumber: c.matchNumber,
+    contestRank: null, prizeMoney: null
+  };
+  $set("pay-name-show", name); $set("pay-phone-show", phone || "—");
+  $set("pay-amount", c.fee); $set("pay-amt-show", c.fee);
+  $set("pay-name-note", `Pay ₹${c.fee} to enter`);
+  // Build clean UPI deep link — extract just the pa= value if full URL was pasted
+  const rawUpi = (c.upi || "").trim();
+  let upiId = rawUpi;
+  if (rawUpi.startsWith("upi://")) {
+    const m = rawUpi.match(/pa=([^&]+)/);
+    if (m) upiId = decodeURIComponent(m[1]);
+  }
+  // Always build a fresh, clean link that Android UPI apps accept
+  const upiLink = upiId
+    ? `upi://pay?pa=${encodeURIComponent(upiId)}&pn=IPL+Contest&am=${c.fee}&tn=IPL+Contest+Entry&cu=INR`
+    : "#";
+  document.getElementById("upi-link-anchor").href = upiLink;
+  const qr = document.getElementById("qr-img");
+  qr.src = c.qr || `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(upiLink)}&size=200x200&margin=10`;
+  showPage("payment");
+};
+
+window.confirmPayment = async () => {
+  const c = cfg();
+  const btn = document.getElementById("pay-confirm-btn");
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    // Use player name as doc ID to prevent duplicates
+    const safeId = currentUser.name.toLowerCase().replace(/\s+/g, "_") + "_" + Date.now();
+    await setDoc(doc(db, "currentMatch", "live", "players", safeId), currentUser);
+    $set("suc-name", currentUser.name);
+    $set("suc-phone", currentUser.phone);
+    $set("suc-match", currentUser.match);
+    $set("suc-matchno", `Match #${c.matchNumber}`);
+    document.getElementById("contest-link-anchor").href = c.contest || "#";
+    showPage("success");
+    const delay = parseInt(c.redirectDelay) || 3;
+    if (c.contest && c.contest !== "#") setTimeout(() => window.open(c.contest, "_blank"), delay * 1000);
+  } catch(e) {
+    console.error("confirmPayment error:", e);
+    showToast("Error: " + e.message, "#e63946");
+  }
+  btn.disabled = false; btn.textContent = "✅ I've Paid — Go to Contest →";
+};
+
+// ─── RENDER ────────────────────────────────────────────────────────────────
+function renderAll() {
+  if (!matchData) return;
+  const c = cfg(), p = pts();
+  const maxS = c.maxSpots || 15, count = p.length;
+
+  $set("home-match-no", `Match #${c.matchNumber || "—"}`);
+  $set("home-teams", `${c.team1 || "—"} <span class="match-vs">vs</span> ${c.team2 || "—"}`, true);
+  $set("home-time", c.time ? `🕖 ${c.time}` : "");
+  $set("home-fee", c.fee || 50);
+  $set("slots-text", `${count}/${maxS}`);
+  $set("slots-count", `${maxS - count} spot${maxS - count !== 1 ? "s" : ""} remaining`);
+  $set("players-count", count);
+
+  const fill = document.getElementById("slots-fill");
+  if (fill) fill.style.width = Math.min(count / maxS * 100, 100).toFixed(0) + "%";
+
+  const joinBtn = document.getElementById("join-btn");
+  const locked = !c.active || !!c.winner || count >= maxS;
+  if (joinBtn) {
+    joinBtn.disabled = locked;
+    joinBtn.textContent = !c.active ? "🔒 Contest Closed"
+      : c.winner ? "🔒 Result Published"
+      : count >= maxS ? "🔒 Contest Full"
+      : "🏏 JOIN NOW";
+  }
+
+  const listEl = document.getElementById("player-list-home"), noEl = document.getElementById("no-players");
+  if (listEl && noEl) {
+    if (count === 0) { listEl.innerHTML = ""; noEl.style.display = "block"; }
+    else {
+      noEl.style.display = "none";
+      listEl.innerHTML = [...p].sort((a,b) => a.joinedAt - b.joinedAt).map((pl, i) => `
+        <div class="player-list-item">
+          <div><div class="player-name">${esc(pl.name)}</div><div class="player-meta">${esc(pl.joined)}</div></div>
+          <div style="font-size:12px;color:var(--muted);">#${i+1}</div>
+        </div>`).join("");
+    }
+  }
+  // Keep admin in sync if open
+  if (document.getElementById("page-admin").classList.contains("active")) loadAdminFields();
+}
+
+function renderResults() {
+  const c = cfg(), p = pts();
+  $set("result-match-label", `Match #${c.matchNumber} · ${c.team1} vs ${c.team2} · ${c.time}`);
+  const box = document.getElementById("result-announced-box");
+  if (box) box.style.display = c.winner ? "block" : "none";
+  if (c.winner) $set("result-winner-text", `🏆 ${c.winner} Won`);
+
+  // Sort by contest rank; unranked go to bottom sorted by join time
+  const ranked   = [...p].filter(pl => pl.contestRank != null && pl.contestRank !== "")
+                         .sort((a,b) => parseInt(a.contestRank) - parseInt(b.contestRank));
+  const unranked = [...p].filter(pl => pl.contestRank == null || pl.contestRank === "")
+                         .sort((a,b) => (a.joinedAt||0) - (b.joinedAt||0));
+  const sorted   = [...ranked, ...unranked];
+  const hasResults = ranked.length > 0;
+  const winner   = hasResults ? ranked[0] : null;
+  const last     = hasResults && ranked.length > 1 ? ranked[ranked.length-1] : null;
+  // Players with prize money
+  const prizeWinners = new Set(ranked.filter(pl => pl.prizeMoney).map(pl => pl.id || pl.name));
+
+  const podium = document.getElementById("podium-section");
+  if (podium) {
+    podium.style.display = hasResults ? "block" : "none";
+    if (hasResults) {
+      $set("pod-first-name", ranked[0].name);
+      $set("pod-first-detail", `Rank #${ranked[0].contestRank}${ranked[0].prizeMoney ? " · ₹" + ranked[0].prizeMoney : ""}`);
+      if (last) {
+        $set("pod-last-name", last.name);
+        $set("pod-last-detail", `Rank #${last.contestRank}`);
+      }
+    }
+  }
+
+  // Fire confetti when results are shown and there's a winner
+  if (hasResults && c.winner) fireConfetti();
+
+  const tbody = document.getElementById("results-tbody");
+  if (!tbody) return;
+  if (p.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px;">No participants yet</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = sorted.map((pl, i) => {
+    const isFirst = hasResults && pl.contestRank == ranked[0].contestRank;
+    const isLast  = hasResults && ranked.length > 1 && pl.contestRank == ranked[ranked.length-1].contestRank;
+    const hasPrize = pl.prizeMoney;
+    const rd    = pl.contestRank ? `#${pl.contestRank}` : "—";
+    const prize = pl.prizeMoney  ? `₹${pl.prizeMoney}`  : "—";
+
+    let badge = `<span class="badge badge-pending">Pending</span>`;
+    if (hasResults) {
+      if (isFirst)      badge = `<span class="badge badge-win">🥇 #1</span>`;
+      else if (isLast)  badge = `<span class="badge badge-loss">🪣 Last</span>`;
+      else if (hasPrize) badge = `<span class="badge badge-prize">🏆 Prize</span>`;
+      else if (pl.contestRank) badge = `<span class="badge badge-ranked">Ranked</span>`;
+    }
+
+    const rowClass = isFirst ? "row-first" : isLast ? "row-last" : hasPrize ? "row-prize" : "";
+    const prizeTag = hasPrize ? `<span class="prize-winner-tag">💰 ₹${pl.prizeMoney}</span>` : "";
+    const animDelay = `animation-delay:${i * 0.07}s`;
+
+    return `<tr class="result-row ${rowClass}" style="${animDelay}">
+      <td class="rank-cell">${i < 3 && pl.contestRank ? ["🥇","🥈","🥉"][i] : i+1}</td>
+      <td><strong>${esc(pl.name)}</strong>${prizeTag}</td>
+      <td class="contest-rank-cell" style="color:${pl.contestRank?"var(--gold)":"var(--muted)"};">${rd}</td>
+      <td class="prize-cell" style="color:${pl.prizeMoney?"var(--green)":"var(--muted)"};">${prize}</td>
+      <td>${badge}</td>
+    </tr>`;
+  }).join("");
+
+  // Stagger-animate rows in
+  document.querySelectorAll(".result-row").forEach((row, i) => {
+    row.style.opacity = "0";
+    row.style.transform = "translateY(12px)";
+    setTimeout(() => {
+      row.style.transition = "opacity 0.35s ease, transform 0.35s ease";
+      row.style.opacity = "1";
+      row.style.transform = "translateY(0)";
+    }, i * 70);
+  });
+}
+
+// ─── CONFETTI ──────────────────────────────────────────────────────────────
+let confettiFired = false;
+function fireConfetti() {
+  if (confettiFired) return;
+  confettiFired = true;
+  const canvas = document.getElementById("confetti-canvas");
+  if (!canvas) return;
+  canvas.style.display = "block";
+  const ctx = canvas.getContext("2d");
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  const COLORS = ["#FFD700","#FFA500","#FF8C00","#2ecc71","#1abc9c","#e63946","#00d4ff","#fff","#ff6b6b","#ffd93d"];
+  const SHAPES = ["rect","circle","star"];
+  const EMOJIS = ["🏆","🥇","🏏","⭐","💰","🎊"];
+
+  // Main confetti pieces
+  const pieces = Array.from({length:180}, () => ({
+    x: Math.random() * canvas.width,
+    y: -20 - Math.random() * canvas.height * .5,
+    w: Math.random() * 12 + 4,
+    h: Math.random() * 7 + 3,
+    color: COLORS[Math.floor(Math.random()*COLORS.length)],
+    shape: SHAPES[Math.floor(Math.random()*SHAPES.length)],
+    rot: Math.random() * 360,
+    vx: (Math.random() - 0.5) * 4,
+    vy: Math.random() * 5 + 2,
+    vr: (Math.random() - 0.5) * 8,
+    wobble: Math.random() * Math.PI * 2,
+    wobbleSpeed: .05 + Math.random() * .05,
+    opacity: .9 + Math.random() * .1
+  }));
+
+  // Big emoji bursts from center
+  const emojiBursts = Array.from({length:12}, (_, i) => ({
+    x: canvas.width/2 + (Math.random()-0.5)*100,
+    y: canvas.height/2 + (Math.random()-0.5)*60,
+    emoji: EMOJIS[Math.floor(Math.random()*EMOJIS.length)],
+    vx: (Math.random()-0.5)*10,
+    vy: -Math.random()*15 - 5,
+    vy_gravity: .4,
+    opacity: 1,
+    size: 24 + Math.random()*20,
+    life: 0
+  }));
+
+  let frame = 0;
+  const totalFrames = 260;
+
+  function drawStar(ctx, cx, cy, r) {
+    ctx.beginPath();
+    for(let i=0;i<5;i++){
+      const a = (i*4*Math.PI/5) - Math.PI/2;
+      const b = a + Math.PI/5;
+      i===0 ? ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a)) : ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a));
+      ctx.lineTo(cx+(r*.4)*Math.cos(b), cy+(r*.4)*Math.sin(b));
+    }
+    ctx.closePath(); ctx.fill();
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const progress = frame / totalFrames;
+
+    pieces.forEach(p => {
+      p.wobble += p.wobbleSpeed;
+      p.x += p.vx + Math.sin(p.wobble) * .5;
+      p.y += p.vy;
+      p.vy += .06; // gravity
+      p.rot += p.vr;
+      const alpha = p.opacity * Math.max(0, 1 - Math.max(0, progress - .6) / .4);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot * Math.PI/180);
+      ctx.fillStyle = p.color;
+      if (p.shape === "rect") {
+        ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+      } else if (p.shape === "circle") {
+        ctx.beginPath(); ctx.arc(0,0,p.w/2,0,Math.PI*2); ctx.fill();
+      } else {
+        drawStar(ctx, 0, 0, p.w/2);
+      }
+      ctx.restore();
+    });
+
+    // Emoji bursts
+    emojiBursts.forEach(e => {
+      if (e.life < 80) {
+        e.x += e.vx; e.y += e.vy; e.vy += e.vy_gravity;
+        e.opacity = Math.max(0, 1 - e.life/60);
+        ctx.globalAlpha = e.opacity;
+        ctx.font = `${e.size}px serif`;
+        ctx.textAlign = "center";
+        ctx.fillText(e.emoji, e.x, e.y);
+        e.life++;
+      }
+    });
+
+    ctx.globalAlpha = 1;
+    frame++;
+    if (frame < totalFrames) requestAnimationFrame(draw);
+    else { canvas.style.display = "none"; confettiFired = false; }
+  }
+  draw();
+}
+
+function renderHistory() {
+  const el = document.getElementById("history-list"); if (!el) return;
+  if (historyList.length === 0) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px;">No past matches recorded yet.</div>`;
+    return;
+  }
+  el.innerHTML = historyList.map(m => `
+    <div class="history-item">
+      <div class="history-match">Match #${m.matchNumber} · ${esc(m.match)}</div>
+      <div class="history-meta">${esc(m.date)} · ${m.playerCount} players${m.winner ? ` · 🏏 ${esc(m.winner)} Won` : ""}</div>
+      <div class="history-results">
+        ${m.first ? `<span class="history-winner">🥇 ${esc(m.first)}${m.firstPrize ? " · ₹"+m.firstPrize : ""}</span>` : ""}
+        ${m.last && m.last !== m.first ? `<span class="history-loser">🪣 ${esc(m.last)}</span>` : ""}
+      </div>
+      <div style="margin-top:8px;">
+        <details style="font-size:12px;color:var(--muted);">
+          <summary style="cursor:pointer;color:var(--gold);font-weight:700;">View all rankings</summary>
+          <div style="margin-top:8px;">
+            ${(m.players||[]).sort((a,b)=>parseInt(a.contestRank||999)-parseInt(b.contestRank||999)).map(pl=>`
+              <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04);">
+                <span>${esc(pl.name)}</span>
+                <span>Rank #${pl.contestRank||"—"} ${pl.prizeMoney?"· ₹"+pl.prizeMoney:""}</span>
+              </div>`).join("")}
+          </div>
+        </details>
+      </div>
+    </div>`).join("");
+}
+
+// ─── ADMIN ─────────────────────────────────────────────────────────────────
+function loadAdminFields() {
+  const c = cfg(), p = pts();
+  const sl = document.getElementById("admin-match-status");
+  if (sl) { sl.textContent = c.active ? "🟢 OPEN" : "🔴 CLOSED"; sl.style.color = c.active ? "var(--green)" : "var(--red)"; }
+  $set("admin-match-no-display", `Match #${c.matchNumber || "—"}`);
+
+  $val("a-match-number", c.matchNumber || "");
+  $val("a-team1", c.team1 || ""); $val("a-team2", c.team2 || "");
+  $val("a-time", c.time || "");
+  $val("a-fee", c.fee || 50); $val("a-maxspots", c.maxSpots || 15);
+  $val("a-qr", c.qr || ""); $val("a-upi", c.upi || "");
+  $val("a-contest", c.contest || ""); $val("a-redirect-delay", c.redirectDelay ?? 3);
+
+  const w1 = document.getElementById("w-opt1"), w2 = document.getElementById("w-opt2");
+  if (w1) { w1.value = c.team1 || ""; w1.textContent = c.team1 || "Team 1"; }
+  if (w2) { w2.value = c.team2 || ""; w2.textContent = c.team2 || "Team 2"; }
+  $val("a-winner", c.winner || "");
+  $set("admin-player-count", p.length);
+
+  // Rank + prize inputs
+  const rfa = document.getElementById("result-feed-area");
+  if (rfa) {
+    if (p.length === 0) {
+      rfa.innerHTML = `<div style="color:var(--muted);font-size:13px;text-align:center;padding:12px;">No players registered yet.</div>`;
+    } else {
+      rfa.innerHTML = [...p].sort((a,b) => (a.joinedAt||0) - (b.joinedAt||0)).map((pl, i) => `
+        <div class="result-input-row">
+          <div class="result-rank-badge rank-badge-1">${i+1}</div>
+          <div style="flex:1;">
+            <div style="font-size:14px;font-weight:700;">${esc(pl.name)}</div>
+            <div style="font-size:11px;color:var(--muted);">${esc(pl.phone)}</div>
+          </div>
+          <input class="form-input" data-pid="${pl.id}" data-field="rank" type="number" min="1"
+            placeholder="Rank" value="${pl.contestRank||""}"
+            style="width:75px;padding:8px 10px;font-size:14px;">
+          <input class="form-input" data-pid="${pl.id}" data-field="prize" type="number" min="0"
+            placeholder="₹ Prize" value="${pl.prizeMoney||""}"
+            style="width:85px;padding:8px 10px;font-size:14px;">
+        </div>`).join("");
+    }
+  }
+
+  // Player list
+  const apl = document.getElementById("admin-player-list");
+  if (apl) {
+    apl.innerHTML = p.length === 0
+      ? `<div style="color:var(--muted);font-size:13px;text-align:center;padding:12px 0;">No players yet</div>`
+      : [...p].sort((a,b) => (a.joinedAt||0) - (b.joinedAt||0)).map((pl, i) => `
+        <div class="player-list-item">
+          <div>
+            <div class="player-name">${esc(pl.name)} — ${esc(pl.phone)}</div>
+            <div class="player-meta">Joined: ${esc(pl.joined)}</div>
+            ${pl.prediction ? `<div class="player-meta">🔮 ${esc(pl.prediction)}</div>` : ""}
+          </div>
+          <div style="font-size:12px;color:var(--muted);">#${i+1}</div>
+        </div>`).join("");
+  }
+  renderAdminHistory();
+}
+
+function renderAdminHistory() {
+  const el = document.getElementById("admin-history-list"); if (!el) return;
+  if (historyList.length === 0) { el.innerHTML = "No archived matches yet."; return; }
+  el.innerHTML = historyList.map(m => `
+    <div class="history-item">
+      <div class="history-match">Match #${m.matchNumber} · ${esc(m.match)}</div>
+      <div class="history-meta">${esc(m.date)} · ${m.playerCount} players${m.winner ? ` · 🏏 ${esc(m.winner)} Won` : ""}</div>
+      <div class="history-results">
+        ${m.first ? `<span class="history-winner">🥇 ${esc(m.first)}${m.firstPrize ? " · ₹"+m.firstPrize : ""}</span>` : ""}
+        ${m.last && m.last !== m.first ? `<span class="history-loser">🪣 ${esc(m.last)}</span>` : ""}
+      </div>
+    </div>`).join("");
+}
+
+// ─── ADMIN ACTIONS ─────────────────────────────────────────────────────────
+window.saveMatch = async () => {
+  const c = cfg();
+  const matchNo = parseInt(document.getElementById("a-match-number").value) || c.matchNumber || 1;
+  const t1 = document.getElementById("a-team1").value.trim();
+  const t2 = document.getElementById("a-team2").value.trim();
+  if (!t1 || !t2) { showToast("Enter both team names", "#e63946"); return; }
+  await updateDoc(matchDocRef, {
+    matchNumber: matchNo,
+    team1: t1, team2: t2,
+    time: document.getElementById("a-time").value.trim(),
+    fee: parseInt(document.getElementById("a-fee").value) || 50,
+    maxSpots: parseInt(document.getElementById("a-maxspots").value) || 15
+  });
+  const w1 = document.getElementById("w-opt1"), w2 = document.getElementById("w-opt2");
+  if (w1) { w1.value = t1; w1.textContent = t1; }
+  if (w2) { w2.value = t2; w2.textContent = t2; }
+  showToast("Match info saved!");
+};
+
+window.savePayment = async () => {
+  await updateDoc(matchDocRef, {
+    qr: document.getElementById("a-qr").value.trim(),
+    upi: document.getElementById("a-upi").value.trim()
+  });
+  showToast("Payment info saved!");
+};
+
+window.saveContest = async () => {
+  await updateDoc(matchDocRef, {
+    contest: document.getElementById("a-contest").value.trim(),
+    redirectDelay: parseInt(document.getElementById("a-redirect-delay").value) || 3
+  });
+  showToast("Contest link saved!");
+};
+
+// Save result — writes ranks + prizes to each player doc AND
+// upserts history/{matchNumber} so it's always up to date
+window.saveResult = async () => {
+  const c = cfg(), p = pts();
+  const winner = document.getElementById("a-winner").value;
+
+  // Collect rank + prize from inputs
+  const updates = {};
+  document.querySelectorAll("#result-feed-area input[data-pid]").forEach(inp => {
+    const pid = inp.getAttribute("data-pid");
+    const field = inp.getAttribute("data-field");
+    const val = inp.value.trim();
+    if (!updates[pid]) updates[pid] = {};
+    if (field === "rank")  updates[pid].contestRank = val !== "" ? parseInt(val) : null;
+    if (field === "prize") updates[pid].prizeMoney  = val !== "" ? parseInt(val) : null;
+  });
+
+  try {
+    const batch = writeBatch(db);
+    Object.entries(updates).forEach(([pid, data]) => {
+      batch.update(doc(db, "currentMatch", "live", "players", pid), data);
+    });
+    batch.update(matchDocRef, { winner });
+    await batch.commit();
+
+    // Build updated player list for history (merge updates into current state)
+    const updatedPlayers = p.map(pl => ({
+      name: pl.name, phone: pl.phone,
+      contestRank: updates[pl.id]?.contestRank ?? pl.contestRank,
+      prizeMoney:  updates[pl.id]?.prizeMoney  ?? pl.prizeMoney
+    }));
+    const ranked = updatedPlayers.filter(pl => pl.contestRank != null)
+      .sort((a,b) => parseInt(a.contestRank) - parseInt(b.contestRank));
+
+    // Upsert history doc keyed by matchNumber — overwrites on every save
+    await setDoc(historyRef(c.matchNumber), {
+      matchNumber: c.matchNumber,
+      match: `${c.team1} vs ${c.team2}`,
+      date: new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }),
+      time: c.time,
+      winner,
+      playerCount: p.length,
+      first: ranked[0]?.name || "",
+      firstPrize: ranked[0]?.prizeMoney || null,
+      last: ranked[ranked.length-1]?.name || "",
+      players: updatedPlayers,
+      updatedAt: Date.now()
+    });
+
+    showToast("Results saved & history updated! 🏆");
+  } catch(e) {
+    showToast("Error: " + e.message, "#e63946");
+  }
+};
+
+// Open New Match — navigate to a form page to fill details before confirming
+window.newMatch = () => {
+  const c = cfg();
+  const nextNo = (c.matchNumber || 0) + 1;
+  document.getElementById("nm-match-number").value = nextNo;
+  document.getElementById("nm-team1").value = "";
+  document.getElementById("nm-team2").value = "";
+  document.getElementById("nm-time").value = "";
+  document.getElementById("nm-fee").value = c.fee || 50;
+  document.getElementById("nm-maxspots").value = c.maxSpots || 15;
+  showPage("new-match");
+};
+
+window.confirmNewMatch = async () => {
+  const matchNo = parseInt(document.getElementById("nm-match-number").value);
+  const t1 = document.getElementById("nm-team1").value.trim();
+  const t2 = document.getElementById("nm-team2").value.trim();
+  const time = document.getElementById("nm-time").value.trim();
+  const fee = parseInt(document.getElementById("nm-fee").value) || 50;
+  const maxSpots = parseInt(document.getElementById("nm-maxspots").value) || 15;
+
+  if (!matchNo) { showToast("Enter a match number", "#e63946"); return; }
+  if (!t1 || !t2) { showToast("Enter both team names", "#e63946"); return; }
+
+  const btn = document.getElementById("nm-confirm-btn");
+  btn.disabled = true; btn.textContent = "Opening…";
+  try {
+    const snap = await getDocs(playersColl);
+    const batch = writeBatch(db);
+    snap.docs.forEach(d => batch.delete(d.ref));
+    batch.update(matchDocRef, {
+      matchNumber: matchNo, team1: t1, team2: t2,
+      time, fee, maxSpots, active: true, winner: ""
+    });
+    await batch.commit();
+    playersList = [];
+    matchData = { ...matchData, matchNumber: matchNo, team1: t1, team2: t2, time, fee, maxSpots, active: true, winner: "" };
+    renderAll(); loadAdminFields();
+    showPage("admin");
+    showToast(`Match #${matchNo}: ${t1} vs ${t2} is now OPEN! ✅`);
+  } catch(e) {
+    showToast("Error: " + e.message, "#e63946");
+    btn.disabled = false; btn.textContent = "🏏 Open This Match →";
+  }
+};
+
+// Archive & Close — closes contest, does NOT delete players (history already saved via saveResult)
+window.archiveMatch = () => {
+  const c = cfg();
+  openModal(
+    "Close Match",
+    `Close Match #${c.matchNumber} (${c.team1} vs ${c.team2}). Make sure you've saved results first. Players will stay visible until you open a new match.`,
+    "🔒 Close Contest",
+    async () => {
+      try {
+        await updateDoc(matchDocRef, { active: false });
+        matchData = { ...matchData, active: false };
+        renderAll(); loadAdminFields();
+        showToast("Match closed. Tap 'Open New Match' when ready for next match.");
+      } catch(e) { showToast("Error: " + e.message, "#e63946"); }
+    }
+  );
+};
+
+window.clearPlayersOnly = () => {
+  openModal("Clear Players", "Delete all current players without affecting history.", "🗑 Clear",
+    async () => {
+      try {
+        const snap = await getDocs(playersColl);
+        const batch = writeBatch(db);
+        snap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+        playersList = [];
+        renderAll(); loadAdminFields();
+        showToast("Players cleared!");
+      } catch(e) { showToast("Error: " + e.message, "#e63946"); }
+    }
+  );
+};
+
+window.clearHistory = () => openModal(
+  "Delete ALL History",
+  `Permanently delete all ${historyList.length} archived matches. Cannot be undone.`,
+  "🗑 Delete Forever",
+  async () => {
+    try {
+      const batch = writeBatch(db);
+      historyList.forEach(m => batch.delete(historyRef(m.matchNumber)));
+      await batch.commit();
+      historyList = []; renderHistory(); renderAdminHistory();
+      showToast("History deleted");
+    } catch(e) { showToast("Error: " + e.message, "#e63946"); }
+  }
+);
+
+// ─── MODAL ─────────────────────────────────────────────────────────────────
+let _cb = null;
+window.openModal = (title, desc, label, cb) => {
+  $set("modal-title", title); $set("modal-desc", desc); $set("modal-confirm-btn", label);
+  $val("modal-pass-input", ""); _cb = cb;
+  document.getElementById("confirm-modal").classList.add("open");
+  setTimeout(() => document.getElementById("modal-pass-input").focus(), 100);
+};
+window.closeModal = () => { document.getElementById("confirm-modal").classList.remove("open"); _cb = null; };
+window.modalConfirm = () => {
+  if (document.getElementById("modal-pass-input").value !== ADMIN_PASS) { showToast("Wrong password", "#e63946"); return; }
+  closeModal(); if (_cb) _cb();
+};
+
+// ─── UTILS ─────────────────────────────────────────────────────────────────
+function $set(id, val, html=false) { const el=document.getElementById(id); if(!el)return; html?el.innerHTML=val:el.textContent=val; }
+function $val(id, val) { const el=document.getElementById(id); if(el) el.value=val; }
+function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function showToast(msg, color="#1a9e50") {
+  const t=document.getElementById("toast"); t.textContent=msg; t.style.background=color;
+  t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 2800);
+}
+
+boot();
+</script>
+
+<style>
+/* ═══════════════════════════════════════════════════
+   IPL CONTEST — PREMIUM THEME
+   ═══════════════════════════════════════════════════ */
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@400;500;600;700&family=Teko:wght@400;500;600;700&display=swap');
+
+:root {
+  --gold:#FFD700; --gold2:#FFA500; --gold3:#FF8C00;
+  --blue:#060d1a; --blue2:#0a1628; --blue3:#0d2040;
+  --red:#e63946; --red2:#ff4757;
+  --green:#2ecc71; --green2:#1abc9c;
+  --purple:#7c3aed; --cyan:#00d4ff;
+  --text:#e8eaf0; --text2:#c8cdd8; --muted:#7a8499;
+  --card:rgba(255,255,255,.04); --card2:rgba(255,255,255,.07);
+  --border:rgba(255,215,0,.15); --border2:rgba(255,255,255,.08);
+  --glow-gold: 0 0 30px rgba(255,215,0,.3);
+  --glow-green: 0 0 30px rgba(46,204,113,.3);
+  --glow-red: 0 0 30px rgba(230,57,70,.3);
+  --r16:16px; --r12:12px; --r8:8px;
+}
+
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--blue);
+  color: var(--text);
+  font-family: 'Rajdhani', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── ANIMATED BACKGROUND ─────────────────────────── */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  background:
+    radial-gradient(ellipse 80% 60% at 20% -10%, rgba(255,140,0,.12) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 50% at 85% 90%, rgba(124,58,237,.1) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 40% at 50% 50%, rgba(0,212,255,.04) 0%, transparent 70%);
+  pointer-events: none; z-index: 0;
+  animation: bgShift 12s ease-in-out infinite alternate;
+}
+@keyframes bgShift {
+  0%   { opacity: .8; }
+  50%  { opacity: 1; }
+  100% { opacity: .7; }
+}
+
+/* Stadium light beams */
+body::after {
+  content: "";
+  position: fixed; inset: 0;
+  background:
+    linear-gradient(135deg, transparent 40%, rgba(255,215,0,.015) 50%, transparent 60%),
+    linear-gradient(225deg, transparent 40%, rgba(255,165,0,.01) 50%, transparent 60%);
+  pointer-events: none; z-index: 0;
+  animation: beamSweep 8s ease-in-out infinite;
+}
+@keyframes beamSweep {
+  0%,100% { transform: translateX(-5%); }
+  50%     { transform: translateX(5%); }
+}
+
+/* ── FLOATING CRICKET PARTICLES ──────────────────── */
+.particle {
+  position: fixed; pointer-events: none; z-index: 0;
+  font-size: 18px; opacity: 0;
+  animation: floatUp 12s ease-in-out infinite;
+}
+@keyframes floatUp {
+  0%   { opacity:0; transform: translateY(100vh) rotate(0deg); }
+  10%  { opacity:.15; }
+  90%  { opacity:.08; }
+  100% { opacity:0; transform: translateY(-20vh) rotate(360deg); }
+}
+
+/* ── NAVIGATION ──────────────────────────────────── */
+.nav {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 20px;
+  background: rgba(6,13,26,.92);
+  border-bottom: 1px solid rgba(255,215,0,.12);
+  position: sticky; top: 0; z-index: 200;
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+.nav::after {
+  content: ""; position: absolute; bottom: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gold), rgba(255,165,0,.5), transparent);
+}
+.nav-logo {
+  font-family: 'Bebas Neue'; font-size: 28px; letter-spacing: 3px;
+  color: var(--gold);
+  text-shadow: 0 0 20px rgba(255,215,0,.5);
+  position: relative;
+}
+.nav-logo span { color: var(--text); }
+.nav-logo::before {
+  content: "🏏"; font-size: 20px; margin-right: 8px;
+  animation: batSwing .8s ease-in-out infinite alternate;
+}
+@keyframes batSwing {
+  from { transform: rotate(-15deg); }
+  to   { transform: rotate(5deg); }
+}
+.admin-btn {
+  font-family: 'Rajdhani'; font-size: 12px; font-weight: 700;
+  letter-spacing: 1.5px; color: var(--muted);
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.1);
+  padding: 7px 16px; border-radius: 20px;
+  cursor: pointer; transition: all .25s;
+  text-transform: uppercase;
+}
+.admin-btn:hover {
+  color: var(--gold); border-color: var(--gold);
+  background: rgba(255,215,0,.08);
+  box-shadow: 0 0 15px rgba(255,215,0,.2);
+}
+
+/* ── LOADER ──────────────────────────────────────── */
+#app-loader {
+  position: fixed; inset: 0;
+  background: var(--blue); z-index: 9999;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 20px;
+}
+.loader-cricket {
+  font-size: 56px;
+  animation: cricketBounce 1s ease-in-out infinite;
+}
+@keyframes cricketBounce {
+  0%,100% { transform: translateY(0) rotate(-10deg); }
+  50%     { transform: translateY(-20px) rotate(10deg); }
+}
+.loader-bar {
+  width: 200px; height: 3px;
+  background: rgba(255,215,0,.1); border-radius: 2px;
+  overflow: hidden;
+}
+.loader-bar::after {
+  content: ""; display: block; height: 100%;
+  background: linear-gradient(90deg, var(--gold2), var(--gold), var(--gold2));
+  animation: loaderSweep 1.4s ease-in-out infinite;
+  background-size: 200% 100%;
+}
+@keyframes loaderSweep { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+.loader-text {
+  font-family: 'Bebas Neue'; font-size: 16px;
+  letter-spacing: 4px; color: rgba(255,215,0,.6);
+  animation: loaderPulse 1.4s ease-in-out infinite alternate;
+}
+@keyframes loaderPulse { from{opacity:.4} to{opacity:1} }
+/* Old spinner hidden */
+.loader-spinner { display: none !important; }
+
+/* ── TOAST ───────────────────────────────────────── */
+.toast {
+  position: fixed; bottom: 28px; left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: linear-gradient(135deg, #0f2a1a, #1a4a2a);
+  color: var(--green); border: 1px solid rgba(46,204,113,.3);
+  padding: 12px 28px; border-radius: 30px;
+  font-weight: 700; font-size: 14px; letter-spacing: .5px;
+  z-index: 9999; opacity: 0; transition: all .35s cubic-bezier(.34,1.56,.64,1);
+  pointer-events: none; white-space: nowrap;
+  box-shadow: 0 4px 24px rgba(0,0,0,.4), 0 0 20px rgba(46,204,113,.15);
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ── PAGES ───────────────────────────────────────── */
+.page { display:none; min-height:calc(100vh - 60px); padding:20px 16px 60px; position:relative; z-index:1; max-width:540px; margin:0 auto; }
+.page.active { display:block; animation: pageFadeIn .4s cubic-bezier(.25,.46,.45,.94); }
+@keyframes pageFadeIn { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+
+/* ── SETUP BANNER ────────────────────────────────── */
+#setup-banner { display:none; background:rgba(230,57,70,.1); border:1px solid rgba(230,57,70,.4); border-radius:var(--r12); padding:20px; margin:16px; font-size:13px; line-height:1.7; position:relative; z-index:1; }
+#setup-banner h3 { font-family:'Bebas Neue'; font-size:20px; color:var(--red); margin-bottom:8px; }
+#setup-error { font-size:11px; color:var(--red); margin-top:8px; word-break:break-all; }
+
+/* ── HERO SECTION ────────────────────────────────── */
+.hero { text-align: center; padding-top: 24px; }
+
+.match-badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: rgba(255,215,0,.06);
+  border: 1px solid rgba(255,215,0,.2);
+  padding: 6px 18px; border-radius: 30px;
+  font-size: 11px; font-weight: 700; letter-spacing: 2.5px;
+  color: rgba(255,215,0,.8); margin-bottom: 16px;
+  text-transform: uppercase;
+  box-shadow: 0 0 20px rgba(255,215,0,.08);
+}
+.match-badge::before {
+  content: "●"; color: var(--red); font-size: 8px;
+  animation: livePulse 1s ease-in-out infinite;
+}
+@keyframes livePulse {
+  0%,100% { opacity:1; transform:scale(1); }
+  50%     { opacity:.3; transform:scale(.7); }
+}
+
+.match-number-tag {
+  font-family: 'Teko', 'Bebas Neue'; font-size: 13px;
+  letter-spacing: 4px; color: rgba(255,215,0,.45);
+  margin-bottom: 2px; text-transform: uppercase;
+}
+
+.match-title {
+  font-family: 'Bebas Neue';
+  font-size: clamp(42px, 10vw, 72px);
+  line-height: .95; color: #fff;
+  margin-bottom: 10px; letter-spacing: 3px;
+  text-shadow: 0 0 40px rgba(255,255,255,.1);
+}
+.match-vs {
+  color: var(--gold);
+  text-shadow: 0 0 20px rgba(255,215,0,.6);
+  font-size: .85em;
+}
+
+.match-info {
+  color: var(--muted); font-size: 13px; font-weight: 600;
+  letter-spacing: 1px; margin-bottom: 10px;
+}
+
+.entry-fee-tag {
+  display: inline-block;
+  background: linear-gradient(135deg, var(--gold3), var(--gold), var(--gold2));
+  color: #000; font-weight: 800; font-size: 17px;
+  letter-spacing: 1px; padding: 10px 32px; border-radius: 40px;
+  margin: 12px 0 28px;
+  box-shadow: 0 4px 24px rgba(255,165,0,.4), 0 0 0 1px rgba(255,215,0,.3);
+  animation: feePulse 2.5s ease-in-out infinite;
+}
+@keyframes feePulse {
+  0%,100% { box-shadow: 0 4px 24px rgba(255,165,0,.4), 0 0 0 1px rgba(255,215,0,.3); }
+  50%     { box-shadow: 0 4px 40px rgba(255,165,0,.7), 0 0 0 3px rgba(255,215,0,.2), 0 0 60px rgba(255,165,0,.2); }
+}
+
+/* ── SLOTS BAR ───────────────────────────────────── */
+.slots-bar { max-width: 320px; margin: 0 auto 28px; }
+.slots-label { display:flex; justify-content:space-between; font-size:11px; font-weight:700; color:var(--muted); margin-bottom:8px; letter-spacing:.5px; text-transform:uppercase; }
+.slots-track {
+  height: 10px; background: rgba(255,255,255,.06);
+  border-radius: 6px; overflow: hidden;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.3);
+}
+.slots-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--gold3), var(--gold), #fff8a0);
+  border-radius: 6px;
+  transition: width 1s cubic-bezier(.4,0,.2,1);
+  box-shadow: 0 0 12px rgba(255,215,0,.4);
+  position: relative; overflow: hidden;
+}
+.slots-fill::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.3) 50%, transparent 100%);
+  animation: slotShimmer 2s infinite;
+}
+@keyframes slotShimmer { from{transform:translateX(-100%)} to{transform:translateX(200%)} }
+.slots-count { text-align:center; font-size:12px; color:var(--gold); font-weight:700; margin-top:8px; letter-spacing:.5px; }
+
+/* ── BUTTONS ─────────────────────────────────────── */
+.cta-btn {
+  display: block; width: 100%; max-width: 320px;
+  margin: 0 auto 12px; padding: 17px 24px;
+  border-radius: 14px; font-family: 'Bebas Neue';
+  font-size: 22px; letter-spacing: 2.5px; border: none;
+  cursor: pointer; transition: all .25s cubic-bezier(.34,1.56,.64,1);
+  background: linear-gradient(135deg, var(--gold3), var(--gold), var(--gold2));
+  color: #000; font-weight: 900;
+  box-shadow: 0 6px 28px rgba(255,165,0,.45), inset 0 1px 0 rgba(255,255,255,.3);
+  position: relative; overflow: hidden;
+}
+.cta-btn::after {
+  content: ""; position: absolute; top: 0; left: -100%; width: 60%; height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.3), transparent);
+  animation: btnShimmer 3s infinite;
+}
+@keyframes btnShimmer { 0%{left:-100%} 100%{left:200%} }
+.cta-btn:hover:not(:disabled) { transform: translateY(-3px) scale(1.01); box-shadow: 0 10px 40px rgba(255,165,0,.6), 0 0 0 2px rgba(255,215,0,.3); }
+.cta-btn:active:not(:disabled) { transform: translateY(0) scale(.98); }
+.cta-btn:disabled { opacity:.35; cursor:not-allowed; transform:none; animation:none; }
+.cta-btn:disabled::after { display:none; }
+
+.cta-btn.secondary {
+  background: transparent; color: var(--gold);
+  border: 1.5px solid rgba(255,215,0,.4); font-size: 17px;
+  padding: 13px; box-shadow: none;
+}
+.cta-btn.secondary::after { display:none; }
+.cta-btn.secondary:hover:not(:disabled) {
+  background: rgba(255,215,0,.08); border-color: var(--gold);
+  box-shadow: 0 0 20px rgba(255,215,0,.15);
+}
+
+.cta-btn.green-btn {
+  background: linear-gradient(135deg, #0f6b34, var(--green), var(--green2));
+  color: #fff;
+  box-shadow: 0 6px 28px rgba(46,204,113,.4), inset 0 1px 0 rgba(255,255,255,.2);
+}
+.cta-btn.green-btn:hover:not(:disabled) { box-shadow: 0 10px 40px rgba(46,204,113,.6); }
+
+.cta-btn.red-btn {
+  background: linear-gradient(135deg, #6b0f1a, var(--red), var(--red2));
+  color: #fff;
+  box-shadow: 0 6px 28px rgba(230,57,70,.4);
+}
+
+/* ── CARDS ───────────────────────────────────────── */
+.card {
+  background: linear-gradient(135deg, rgba(255,255,255,.05) 0%, rgba(255,255,255,.02) 100%);
+  border: 1px solid rgba(255,215,0,.12);
+  border-radius: 20px; padding: 22px 20px; margin-bottom: 16px;
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  transition: transform .25s, box-shadow .25s;
+  box-shadow: 0 4px 24px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.06);
+}
+.card:hover { transform: translateY(-2px); box-shadow: 0 8px 40px rgba(0,0,0,.3), 0 0 20px rgba(255,215,0,.05), inset 0 1px 0 rgba(255,255,255,.08); }
+.card-title {
+  font-family: 'Bebas Neue'; font-size: 18px; letter-spacing: 2px;
+  color: var(--gold); margin-bottom: 16px;
+  display: flex; align-items: center; gap: 8px;
+}
+.card-title::after { content:""; flex:1; height:1px; background:linear-gradient(90deg,rgba(255,215,0,.2),transparent); }
+
+/* ── FORM ELEMENTS ───────────────────────────────── */
+.form-group { margin-bottom: 16px; }
+.form-label { display:block; font-size:11px; font-weight:700; letter-spacing:1.5px; color:var(--muted); text-transform:uppercase; margin-bottom:7px; }
+.optional-tag { color:rgba(255,165,0,.4); font-size:10px; font-weight:400; letter-spacing:0; text-transform:none; margin-left:6px; }
+.form-input {
+  width: 100%; padding: 13px 16px; border-radius: 12px;
+  background: rgba(255,255,255,.05);
+  border: 1.5px solid rgba(255,255,255,.1);
+  color: var(--text); font-family: 'Rajdhani'; font-size: 16px; font-weight: 500;
+  outline: none; transition: all .2s;
+}
+.form-input:focus { border-color: rgba(255,215,0,.5); background: rgba(255,215,0,.04); box-shadow: 0 0 0 3px rgba(255,215,0,.08); }
+.form-input::placeholder { color: rgba(122,132,153,.6); }
+select.form-input option { background: #0d2040; color: var(--text); }
+
+/* ── FUNNY SECTION ───────────────────────────────── */
+.funny-section-header { display:flex; align-items:center; gap:10px; cursor:pointer; padding:12px 16px; border-radius:12px; background:rgba(255,165,0,.05); border:1px dashed rgba(255,215,0,.2); margin-bottom:12px; transition:.2s; }
+.funny-section-header:hover { background:rgba(255,165,0,.1); border-color:rgba(255,215,0,.4); }
+.funny-title { font-size:14px; font-weight:700; color:var(--gold); flex:1; }
+.funny-chevron { color:var(--gold); font-size:12px; transition:.3s; }
+.funny-section-header.open .funny-chevron { transform:rotate(180deg); }
+.funny-fields { display:none; }
+.funny-fields.open { display:block; }
+.funny-note { font-size:12px; color:var(--muted); text-align:center; margin-bottom:12px; font-style:italic; }
+.funny-pill { display:inline-block; padding:2px 8px; border-radius:12px; background:rgba(255,165,0,.08); border:1px solid rgba(255,165,0,.2); font-size:11px; color:rgba(255,215,0,.7); margin-top:3px; }
+
+/* ── STEPS ───────────────────────────────────────── */
+.steps { display:flex; justify-content:center; gap:8px; margin-bottom:28px; }
+.step { width:36px; height:4px; border-radius:3px; background:rgba(255,255,255,.08); transition:.4s; }
+.step.active { background:var(--gold); box-shadow:0 0 10px rgba(255,215,0,.4); }
+.step.done { background:var(--green); box-shadow:0 0 10px rgba(46,204,113,.3); }
+
+/* ── PAGE TITLES ─────────────────────────────────── */
+.page-title { font-family:'Bebas Neue'; font-size:30px; letter-spacing:2.5px; margin-bottom:4px; }
+.page-sub { color:var(--muted); font-size:13px; margin-bottom:24px; line-height:1.5; }
+
+/* ── QR / PAYMENT ────────────────────────────────── */
+.qr-container { text-align:center; padding:16px 0; }
+.qr-frame {
+  display: inline-block; padding: 16px; background: #fff;
+  border-radius: 20px; margin-bottom: 16px;
+  box-shadow: 0 0 40px rgba(255,215,0,.2), 0 8px 32px rgba(0,0,0,.4);
+}
+.qr-frame img { display:block; width:180px; height:180px; object-fit:contain; }
+.qr-amount { font-family:'Bebas Neue'; font-size:36px; color:var(--gold); text-shadow:0 0 20px rgba(255,215,0,.4); }
+.qr-note { color:var(--muted); font-size:13px; margin-top:4px; }
+.upi-link-btn {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; max-width: 280px; margin: 16px auto 0;
+  padding: 14px; border-radius: 14px; font-family: 'Rajdhani';
+  font-size: 15px; font-weight: 700;
+  background: rgba(255,255,255,.05); border: 1.5px solid rgba(255,255,255,.15);
+  color: var(--text); text-decoration: none; letter-spacing: .5px; transition: .25s;
+}
+.upi-link-btn:hover { border-color:var(--gold); color:var(--gold); background:rgba(255,215,0,.06); }
+
+/* ── SUCCESS PAGE ────────────────────────────────── */
+.success-icon { text-align:center; font-size:72px; margin:24px 0 8px; animation: trophyBounce .6s cubic-bezier(.34,1.56,.64,1); }
+@keyframes trophyBounce { from{transform:scale(0) rotate(-15deg);opacity:0} to{transform:scale(1) rotate(0);opacity:1} }
+.success-title { font-family:'Bebas Neue'; font-size:42px; text-align:center; letter-spacing:3px; background:linear-gradient(135deg,var(--gold),var(--green)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.success-sub { text-align:center; color:var(--muted); font-size:14px; margin:8px 0 24px; }
+.contest-link-box { background:rgba(46,204,113,.06); border:1.5px solid rgba(46,204,113,.25); border-radius:16px; padding:20px; text-align:center; margin-bottom:20px; }
+.contest-link-label { font-size:10px; font-weight:700; letter-spacing:2px; color:var(--green); text-transform:uppercase; margin-bottom:10px; }
+.contest-link-btn { display:inline-block; padding:14px 32px; border-radius:12px; background:linear-gradient(135deg,#0f6b34,var(--green)); color:#fff; font-family:'Bebas Neue'; font-size:22px; letter-spacing:2px; text-decoration:none; box-shadow:0 4px 24px rgba(46,204,113,.35); transition:.2s; }
+.contest-link-btn:hover { transform:translateY(-2px); box-shadow:0 8px 32px rgba(46,204,113,.5); }
+
+/* ── INFO ROWS ───────────────────────────────────── */
+.info-row { display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid rgba(255,255,255,.04); font-size:14px; }
+.info-row:last-child { border-bottom:none; }
+.info-key { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+.info-val { font-weight:700; color:var(--text); }
+
+/* ── PLAYER LIST (HOME) ──────────────────────────── */
+.player-list-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border-radius: 12px;
+  background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+  margin-bottom: 8px; font-size: 14px;
+  animation: playerSlideIn .35s cubic-bezier(.25,.46,.45,.94) both;
+  transition: background .2s, transform .2s;
+}
+.player-list-item:hover { background:rgba(255,215,0,.04); transform:translateX(3px); }
+@keyframes playerSlideIn { from{opacity:0;transform:translateX(-16px)} to{opacity:1;transform:translateX(0)} }
+.player-name { font-weight:700; font-size:15px; }
+.player-meta { color:var(--muted); font-size:11px; margin-top:1px; }
+
+/* ── RESULTS TABLE ───────────────────────────────── */
+.results-table { width:100%; border-collapse:separate; border-spacing:0 4px; font-size:14px; }
+.results-table th {
+  text-align:left; padding:8px 12px;
+  font-size:10px; font-weight:700; letter-spacing:1.5px;
+  color:var(--muted); text-transform:uppercase;
+  border-bottom:1px solid rgba(255,215,0,.1);
+}
+.results-table td { padding:12px; background:rgba(255,255,255,.02); }
+.results-table td:first-child { border-radius:10px 0 0 10px; }
+.results-table td:last-child  { border-radius:0 10px 10px 0; }
+
+/* row types */
+.row-first td { background:linear-gradient(135deg, rgba(255,215,0,.12) 0%, rgba(255,165,0,.06) 100%); border-top:1px solid rgba(255,215,0,.2); border-bottom:1px solid rgba(255,215,0,.2); }
+.row-first td:first-child { border-left:3px solid var(--gold); border-radius:10px 0 0 10px; }
+.row-last td { background:rgba(230,57,70,.06); }
+.row-last td:first-child { border-left:3px solid var(--red); border-radius:10px 0 0 10px; }
+.row-prize td { background:rgba(46,204,113,.05); }
+.row-prize td:first-child { border-left:3px solid var(--green); border-radius:10px 0 0 10px; }
+
+.rank-cell { font-size:18px; text-align:center; width:36px; }
+.contest-rank-cell { font-weight:700; }
+.prize-cell { font-weight:700; }
+
+/* ── BADGES ──────────────────────────────────────── */
+.badge { display:inline-block; padding:4px 10px; border-radius:20px; font-size:11px; font-weight:700; letter-spacing:.5px; }
+.badge-win    { background:rgba(46,204,113,.15); color:var(--green); border:1px solid rgba(46,204,113,.3); }
+.badge-pending{ background:rgba(255,165,0,.1);   color:var(--gold);  border:1px solid rgba(255,165,0,.2); }
+.badge-loss   { background:rgba(230,57,70,.12);  color:var(--red);   border:1px solid rgba(230,57,70,.3); }
+.badge-prize  { background:rgba(46,204,113,.12); color:var(--green2);border:1px solid rgba(46,204,113,.25); }
+.badge-ranked { background:rgba(255,255,255,.04);color:var(--muted); border:1px solid rgba(255,255,255,.08); }
+
+/* ── PRIZE TAG ───────────────────────────────────── */
+.prize-winner-tag {
+  display: inline-flex; align-items: center; gap: 3px;
+  margin-left: 7px;
+  background: linear-gradient(135deg, rgba(46,204,113,.2), rgba(26,156,80,.1));
+  border: 1px solid rgba(46,204,113,.4);
+  color: var(--green); font-size: 10px; font-weight: 800;
+  padding: 2px 8px; border-radius: 10px; vertical-align: middle;
+  animation: prizePulse 2s ease-in-out infinite;
+  box-shadow: 0 0 10px rgba(46,204,113,.2);
+}
+@keyframes prizePulse {
+  0%,100% { box-shadow:0 0 8px rgba(46,204,113,.2); transform:scale(1); }
+  50%     { box-shadow:0 0 18px rgba(46,204,113,.5); transform:scale(1.03); }
+}
+
+/* ── PODIUM ──────────────────────────────────────── */
+.podium-row { display:flex; gap:12px; margin-bottom:20px; }
+.podium-card {
+  flex: 1; border-radius: 18px; padding: 18px 12px;
+  text-align: center; border: 1px solid;
+  backdrop-filter: blur(12px);
+  transition: transform .25s;
+}
+.podium-card:hover { transform: translateY(-4px); }
+.podium-card.gold {
+  background: linear-gradient(160deg, rgba(255,215,0,.12), rgba(255,140,0,.06));
+  border-color: rgba(255,215,0,.35);
+  box-shadow: 0 4px 24px rgba(255,215,0,.1), inset 0 1px 0 rgba(255,215,0,.15);
+  animation: podiumDrop .5s cubic-bezier(.34,1.56,.64,1) both;
+}
+.podium-card.last-place {
+  background: linear-gradient(160deg, rgba(230,57,70,.1), rgba(230,57,70,.04));
+  border-color: rgba(230,57,70,.25);
+  animation: podiumDrop .5s cubic-bezier(.34,1.56,.64,1) .15s both;
+}
+@keyframes podiumDrop { from{opacity:0;transform:translateY(-24px) scale(.9)} to{opacity:1;transform:translateY(0) scale(1)} }
+.podium-emoji { font-size:32px; margin-bottom:8px; }
+.podium-label { font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; margin-bottom:6px; }
+.podium-card.gold .podium-label { color:var(--gold); }
+.podium-card.last-place .podium-label { color:var(--red); }
+.podium-name { font-family:'Bebas Neue'; font-size:20px; letter-spacing:1px; }
+.podium-detail { font-size:11px; color:var(--muted); margin-top:4px; }
+
+/* ── RESULT WINNER BOX ───────────────────────────── */
+#result-announced-box {
+  background: linear-gradient(135deg, rgba(255,215,0,.1), rgba(46,204,113,.06)) !important;
+  border: 1px solid rgba(255,215,0,.25) !important;
+  animation: resultReveal .7s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes resultReveal { from{opacity:0;transform:scale(.85) translateY(-10px)} to{opacity:1;transform:scale(1) translateY(0)} }
+
+/* winner row glow */
+.row-first { animation: winnerGlow 2.5s ease-in-out infinite; }
+@keyframes winnerGlow {
+  0%,100% { filter:none; }
+  50%     { filter:drop-shadow(0 0 8px rgba(255,215,0,.3)); }
+}
+
+/* ── TABS ────────────────────────────────────────── */
+.tab-row { display:flex; gap:8px; margin-bottom:20px; background:rgba(255,255,255,.03); padding:4px; border-radius:14px; border:1px solid rgba(255,255,255,.06); }
+.tab-btn { flex:1; padding:10px 8px; border-radius:10px; font-family:'Rajdhani'; font-size:13px; font-weight:700; letter-spacing:1px; border:none; cursor:pointer; transition:.25s; background:transparent; color:var(--muted); text-align:center; }
+.tab-btn.active { background:rgba(255,215,0,.12); color:var(--gold); box-shadow:0 0 12px rgba(255,215,0,.1); }
+
+/* ── HISTORY ─────────────────────────────────────── */
+.history-item {
+  padding: 14px 16px; border-radius: 14px;
+  background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
+  margin-bottom: 10px; font-size: 13px;
+  transition: transform .2s, background .2s;
+}
+.history-item:hover { background:rgba(255,215,0,.04); transform:translateX(3px); }
+.history-match { font-weight:700; color:var(--text); margin-bottom:4px; font-size:14px; }
+.history-meta { color:var(--muted); font-size:11px; letter-spacing:.3px; }
+.history-results { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.history-winner { background:rgba(255,215,0,.1); border:1px solid rgba(255,215,0,.25); color:var(--gold); padding:4px 12px; border-radius:20px; font-size:12px; font-weight:700; }
+.history-loser  { background:rgba(230,57,70,.08); border:1px solid rgba(230,57,70,.2); color:var(--red); padding:4px 12px; border-radius:20px; font-size:12px; font-weight:700; }
+
+/* ── ADMIN ───────────────────────────────────────── */
+.admin-panel { max-width:480px; margin:0 auto; }
+.admin-section { margin-bottom:28px; }
+.admin-section-title { font-family:'Bebas Neue'; font-size:18px; color:var(--gold); letter-spacing:1.5px; margin-bottom:14px; padding-bottom:8px; border-bottom:1px solid rgba(255,215,0,.1); display:flex; align-items:center; gap:8px; }
+.save-btn { padding:10px 24px; border-radius:10px; font-family:'Rajdhani'; font-size:14px; font-weight:700; letter-spacing:1px; background:rgba(255,215,0,.08); border:1.5px solid rgba(255,215,0,.3); color:var(--gold); cursor:pointer; transition:.2s; }
+.save-btn:hover { background:var(--gold); color:#000; box-shadow:0 0 20px rgba(255,215,0,.3); }
+.admin-login-box { max-width:320px; margin:60px auto 0; text-align:center; }
+.divider { height:1px; background:linear-gradient(90deg,transparent,rgba(255,215,0,.1),transparent); margin:22px 0; }
+.result-input-row { display:flex; align-items:center; gap:8px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,.04); }
+.result-rank-badge { display:flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; font-weight:700; font-size:13px; flex-shrink:0; }
+.rank-badge-1 { background:rgba(255,215,0,.15); color:var(--gold); border:1px solid rgba(255,215,0,.3); }
+
+/* ── MODAL ───────────────────────────────────────── */
+.modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.75); z-index:9000; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(8px); }
+.modal-overlay.open { display:flex; animation: modalFadeIn .25s ease; }
+@keyframes modalFadeIn { from{opacity:0} to{opacity:1} }
+.modal-box { background:linear-gradient(135deg,#0a1628,#0d2040); border:1px solid rgba(255,215,0,.15); border-radius:20px; padding:32px 24px; max-width:340px; width:100%; text-align:center; box-shadow:0 20px 60px rgba(0,0,0,.6), 0 0 40px rgba(255,215,0,.05); animation: modalSlideUp .3s cubic-bezier(.34,1.56,.64,1); }
+@keyframes modalSlideUp { from{transform:translateY(30px) scale(.95);opacity:0} to{transform:translateY(0) scale(1);opacity:1} }
+.modal-icon { font-size:44px; margin-bottom:12px; }
+.modal-title { font-family:'Bebas Neue'; font-size:24px; letter-spacing:2px; color:var(--red); margin-bottom:8px; }
+.modal-desc { font-size:13px; color:var(--muted); margin-bottom:20px; line-height:1.6; }
+.modal-input { width:100%; margin-bottom:16px; }
+.modal-btns { display:flex; gap:10px; }
+.modal-btns button { flex:1; padding:12px; border-radius:10px; font-family:'Rajdhani'; font-size:14px; font-weight:700; cursor:pointer; letter-spacing:.5px; transition:.2s; }
+.modal-cancel  { background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); color:var(--muted); }
+.modal-cancel:hover  { background:rgba(255,255,255,.1); }
+.modal-confirm { background:rgba(230,57,70,.15); border:1px solid rgba(230,57,70,.4); color:var(--red); }
+.modal-confirm:hover { background:var(--red); color:#fff; }
+
+/* ── CONFETTI ────────────────────────────────────── */
+#confetti-canvas { display:none; position:fixed; inset:0; pointer-events:none; z-index:8000; }
+
+/* ── SCROLLBAR ───────────────────────────────────── */
+::-webkit-scrollbar { width:4px; }
+::-webkit-scrollbar-track { background:rgba(255,255,255,.03); }
+::-webkit-scrollbar-thumb { background:rgba(255,215,0,.2); border-radius:4px; }
+::-webkit-scrollbar-thumb:hover { background:rgba(255,215,0,.4); }
+
+/* ── SHIMMER JOIN BTN ────────────────────────────── */
+#join-btn:not(:disabled) { position:relative; overflow:hidden; }
+
+@media(max-width:360px) { .match-title{font-size:36px;} .nav-logo{font-size:22px;} }
+</style>
+</head>
+<body>
+
+<canvas id="confetti-canvas"></canvas>
+<div class="particle" style="left:5%;animation-delay:0s;animation-duration:14s">🏏</div>
+<div class="particle" style="left:20%;animation-delay:3s;animation-duration:11s">🏆</div>
+<div class="particle" style="left:40%;animation-delay:6s;animation-duration:16s">⭐</div>
+<div class="particle" style="left:60%;animation-delay:1.5s;animation-duration:13s">🎯</div>
+<div class="particle" style="left:75%;animation-delay:8s;animation-duration:12s">🏏</div>
+<div class="particle" style="left:88%;animation-delay:4s;animation-duration:15s">💥</div>
+<div id="app-loader">
+  <div class="loader-cricket">🏏</div>
+  <div class="loader-bar"></div>
+  <div class="loader-text">Loading IPL Contest</div>
+</div>
+<nav class="nav">
+  <div class="nav-logo">IPL <span>CONTEST</span></div>
+  <button class="admin-btn" onclick="goAdmin()">⚙ Admin</button>
+</nav>
+<div id="toast" class="toast"></div>
+
+<div id="setup-banner">
+  <h3>🔧 Firebase Setup Required</h3>
+  <p>Replace the Firebase config values at the top of the script with your project's config from Firebase Console → Project Settings.</p>
+  <p id="setup-error"></p>
+</div>
+
+<!-- HOME -->
+<div id="page-home" class="page">
+  <div class="hero">
+    <div class="match-badge">Today's Match</div>
+    <div class="match-number-tag" id="home-match-no">Match #—</div>
+    <div class="match-title-wrap" style="position:relative;display:inline-block;margin-bottom:0;">
+      <div class="match-title" id="home-teams">— <span class="match-vs">vs</span> —</div>
+    </div>
+    <div class="match-info" id="home-time"></div>
+    <div class="entry-fee-tag">Entry Fee: ₹<span id="home-fee">50</span></div>
+    <div class="slots-bar">
+      <div class="slots-label"><span>Spots Filled</span><span id="slots-text">0/15</span></div>
+      <div class="slots-track"><div class="slots-fill" id="slots-fill" style="width:0%"></div></div>
+      <div class="slots-count" id="slots-count">15 spots remaining</div>
+    </div>
+    <button class="cta-btn" id="join-btn" onclick="goRegister()">🏏 JOIN NOW</button>
+    <button class="cta-btn secondary" onclick="showResults()">📊 View Results</button>
+  </div>
+  <div class="card">
+    <div class="card-title">How It Works</div>
+    <div style="display:flex;flex-direction:column;gap:12px;font-size:14px;color:#bcc4d6;">
+      <div>① <strong style="color:var(--text)">Fill Details</strong> — Enter your name + optional fun facts</div>
+      <div>② <strong style="color:var(--text)">Pay Entry Fee</strong> — Scan QR or tap UPI link</div>
+      <div>③ <strong style="color:var(--text)">Join Contest</strong> — Redirected to contest app automatically</div>
+      <div>④ <strong style="color:var(--text)">Win Prizes</strong> — Check the live dashboard after the match</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Players Joined (<span id="players-count">0</span>)</div>
+    <div id="player-list-home"></div>
+    <div id="no-players" style="color:var(--muted);font-size:13px;text-align:center;padding:10px 0;">No players yet. Be the first!</div>
+  </div>
+</div>
+
+<!-- REGISTER -->
+<div id="page-register" class="page">
+  <div class="steps"><div class="step active"></div><div class="step"></div><div class="step"></div></div>
+  <div class="page-title">Your Details</div>
+  <div class="page-sub">Just your name to enter. Everything else is for fun 😄</div>
+  <div class="card">
+    <div class="form-group"><label class="form-label">Full Name <span style="color:var(--red)">*</span></label><input class="form-input" id="reg-name" type="text" placeholder="Enter your name"></div>
+    <div class="form-group"><label class="form-label">Phone Number <span class="optional-tag">(optional)</span></label><input class="form-input" id="reg-phone" type="tel" placeholder="10-digit mobile number" maxlength="10"></div>
+  </div>
+  <div class="card" style="padding:16px;">
+    <div class="funny-section-header" id="funny-toggle" onclick="toggleFunny()">
+      <span style="font-size:20px;">🎭</span><div class="funny-title">Fun Questions (Optional)</div>
+      <div style="font-size:11px;color:var(--muted);margin-right:8px;">Don't be boring</div><div class="funny-chevron">▼</div>
+    </div>
+    <div class="funny-fields" id="funny-fields">
+      <div class="funny-note">Your answers may appear on the results board 😏</div>
+      <div class="form-group"><label class="form-label">🧿 Pre-Match Superstition <span class="optional-tag">(optional)</span></label><input class="form-input" id="reg-superstition" type="text" placeholder="e.g. I wear the same underwear since 2019"></div>
+      <div class="form-group"><label class="form-label">🍟 Lucky Snack <span class="optional-tag">(optional)</span></label><input class="form-input" id="reg-snack" type="text" placeholder="e.g. Maggi or nothing (I'm broke)"></div>
+      <div class="form-group"><label class="form-label">💸 How You'll Spend the Prize <span class="optional-tag">(optional)</span></label><input class="form-input" id="reg-spend" type="text" placeholder="e.g. Buy tickets to next match"></div>
+      <div class="form-group"><label class="form-label">🔮 Bold Match Prediction <span class="optional-tag">(optional)</span></label><input class="form-input" id="reg-prediction" type="text" placeholder="e.g. Virat scores 0 and still wins PoM"></div>
+    </div>
+  </div>
+  <button class="cta-btn" onclick="goPayment()">Continue to Payment →</button>
+  <button class="cta-btn secondary" onclick="showPage('home')" style="margin-top:8px;">← Back</button>
+</div>
+
+<!-- PAYMENT -->
+<div id="page-payment" class="page">
+  <div class="steps"><div class="step done"></div><div class="step active"></div><div class="step"></div></div>
+  <div class="page-title">Pay Entry Fee</div>
+  <div class="page-sub">Scan QR or use UPI link to complete payment</div>
+  <div class="card">
+    <div class="qr-container">
+      <div class="qr-frame"><img id="qr-img" src="" alt="UPI QR Code" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22><rect width=%22200%22 height=%22200%22 fill=%22%23f5f5f5%22/><text x=%22100%22 y=%22105%22 text-anchor=%22middle%22 font-family=%22Arial%22 font-size=%2212%22 fill=%22%23888%22>Set QR in Admin</text></svg>'"></div>
+      <div class="qr-amount">₹<span id="pay-amount">50</span></div>
+      <div class="qr-note" id="pay-name-note">Pay to complete registration</div>
+      <a class="upi-link-btn" id="upi-link-anchor" href="#" target="_blank"><span>💳</span> Pay via UPI App</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="info-row"><span class="info-key">Name</span><span class="info-val" id="pay-name-show">—</span></div>
+    <div class="info-row"><span class="info-key">Phone</span><span class="info-val" id="pay-phone-show">—</span></div>
+    <div class="info-row"><span class="info-key">Amount</span><span class="info-val">₹<span id="pay-amt-show">50</span></span></div>
+  </div>
+  <div style="font-size:12px;color:var(--muted);text-align:center;margin-bottom:16px;">After paying, tap below. You'll be redirected to the contest app automatically.</div>
+  <button class="cta-btn green-btn" id="pay-confirm-btn" onclick="confirmPayment()">✅ I've Paid — Go to Contest →</button>
+  <button class="cta-btn secondary" onclick="showPage('register')" style="margin-top:8px;">← Back</button>
+</div>
+
+<!-- SUCCESS -->
+<div id="page-success" class="page">
+  <div class="steps"><div class="step done"></div><div class="step done"></div><div class="step active"></div></div>
+  <div class="success-icon">🏆</div>
+  <div class="success-title">You're In!</div>
+  <div class="success-sub">Registration complete. Redirecting to contest app…</div>
+  <div class="contest-link-box">
+    <div class="contest-link-label">🎯 Open Contest App</div>
+    <a class="contest-link-btn" id="contest-link-anchor" href="#" target="_blank">JOIN CONTEST →</a>
+    <div style="font-size:11px;color:rgba(46,204,113,.6);margin-top:8px;">Tap above if not redirected automatically</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Your Entry</div>
+    <div class="info-row"><span class="info-key">Match</span><span class="info-val" id="suc-matchno">—</span></div>
+    <div class="info-row"><span class="info-key">Teams</span><span class="info-val" id="suc-match">—</span></div>
+    <div class="info-row"><span class="info-key">Name</span><span class="info-val" id="suc-name">—</span></div>
+    <div class="info-row"><span class="info-key">Phone</span><span class="info-val" id="suc-phone">—</span></div>
+  </div>
+  <button class="cta-btn secondary" onclick="showPage('home')" style="margin-top:8px;">← Back to Home</button>
+</div>
+
+<!-- RESULTS -->
+<div id="page-results" class="page">
+  <div class="page-title">📊 Match Results</div>
+  <div class="page-sub" id="result-match-label">—</div>
+  <div class="tab-row">
+    <div class="tab-btn active" id="tab-today" onclick="switchTab('today')">Today</div>
+    <div class="tab-btn" id="tab-history" onclick="switchTab('history')">History</div>
+  </div>
+  <div id="results-today">
+    <div id="result-announced-box" style="display:none;" class="card">
+      <div style="text-align:center;padding:12px 0;">
+        <div style="font-size:10px;font-weight:700;letter-spacing:3px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;">🏆 Official Match Result</div>
+        <div style="font-family:'Bebas Neue';font-size:42px;letter-spacing:3px;background:linear-gradient(135deg,var(--gold),#fff,var(--gold2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;text-shadow:none;" id="result-winner-text">—</div>
+        <div style="display:flex;justify-content:center;gap:6px;margin-top:10px;">
+          <span style="font-size:20px;">🥇</span>
+          <span style="font-size:20px;">🏏</span>
+          <span style="font-size:20px;">🎊</span>
+        </div>
+      </div>
+    </div>
+    <div id="podium-section" style="display:none;margin-bottom:16px;">
+      <div style="font-family:'Bebas Neue';font-size:22px;color:var(--gold);letter-spacing:2px;margin-bottom:14px;text-align:center;text-shadow:0 0 20px rgba(255,215,0,.4);">🏅 TODAY'S LEADERBOARD</div>
+      <div class="podium-row">
+        <div class="podium-card gold"><div class="podium-emoji">🥇</div><div class="podium-label">1st Place</div><div class="podium-name" id="pod-first-name">—</div><div class="podium-detail" id="pod-first-detail"></div></div>
+        <div class="podium-card last-place"><div class="podium-emoji">🪣</div><div class="podium-label">Last Place</div><div class="podium-name" id="pod-last-name">—</div><div class="podium-detail" id="pod-last-detail"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Participants</div>
+      <table class="results-table">
+        <thead><tr><th>#</th><th>Name</th><th>Rank</th><th>Prize</th><th>Status</th></tr></thead>
+        <tbody id="results-tbody"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px;">No participants yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <div id="results-history" style="display:none;"><div id="history-list"><div style="color:var(--muted);font-size:13px;text-align:center;padding:20px;">No past matches recorded yet.</div></div></div>
+  <button class="cta-btn secondary" onclick="showPage('home')" style="margin-top:8px;">← Back</button>
+</div>
+
+<!-- NEW MATCH FORM PAGE -->
+<div id="page-new-match" class="page">
+  <div class="admin-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <div class="page-title">🏏 New Match</div>
+      <button class="admin-btn" onclick="showPage('admin')">← Back</button>
+    </div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:20px;background:rgba(255,215,0,.05);border:1px dashed rgba(255,215,0,.2);border-radius:8px;padding:12px;">
+      Fill in the match details below. All current players will be cleared when you confirm.
+    </div>
+    <div class="card">
+      <div class="form-group"><label class="form-label">Match Number <span style="color:var(--red)">*</span></label><input class="form-input" id="nm-match-number" type="number" placeholder="e.g. 12" min="1"></div>
+      <div class="form-group"><label class="form-label">Team 1 <span style="color:var(--red)">*</span></label><input class="form-input" id="nm-team1" type="text" placeholder="e.g. MI"></div>
+      <div class="form-group"><label class="form-label">Team 2 <span style="color:var(--red)">*</span></label><input class="form-input" id="nm-team2" type="text" placeholder="e.g. CSK"></div>
+      <div class="form-group"><label class="form-label">Match Time</label><input class="form-input" id="nm-time" type="text" placeholder="e.g. 7:30 PM IST"></div>
+      <div class="form-group"><label class="form-label">Entry Fee (₹)</label><input class="form-input" id="nm-fee" type="number" placeholder="50" min="0"></div>
+      <div class="form-group"><label class="form-label">Max Spots</label><input class="form-input" id="nm-maxspots" type="number" placeholder="15" min="1"></div>
+    </div>
+    <button class="cta-btn green-btn" id="nm-confirm-btn" onclick="confirmNewMatch()" style="margin-top:8px;">🏏 Open This Match →</button>
+    <button class="cta-btn secondary" onclick="showPage('admin')" style="margin-top:8px;">Cancel</button>
+  </div>
+</div>
+
+<!-- ADMIN LOGIN -->
+<div id="page-admin-login" class="page">
+  <div class="admin-login-box">
+    <div class="page-title" style="text-align:center;">Admin Panel</div>
+    <div class="page-sub" style="text-align:center;">Enter password to continue</div>
+    <div class="card">
+      <div class="form-group"><label class="form-label">Password</label><input class="form-input" id="admin-pass-input" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')checkAdmin()"></div>
+      <button class="save-btn" style="width:100%;padding:12px;" onclick="checkAdmin()">Login →</button>
+    </div>
+    <button class="cta-btn secondary" onclick="showPage('home')" style="margin-top:8px;font-size:14px;padding:10px;">← Back to Home</button>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div id="page-admin" class="page">
+  <div class="admin-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div class="page-title">Admin Panel</div>
+      <button class="admin-btn" onclick="showPage('home')">Exit</button>
+    </div>
+
+    <div style="background:rgba(255,215,0,.05);border:1px dashed rgba(255,215,0,.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;font-size:12px;color:var(--muted);">
+      Current: <strong style="color:var(--gold)" id="admin-match-no-display">Match #—</strong> &nbsp;·&nbsp; Status: <strong id="admin-match-status">🔴 CLOSED</strong>
+    </div>
+
+    <!-- LIFECYCLE -->
+    <div class="admin-section">
+      <div class="admin-section-title">🔄 Match Lifecycle</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="cta-btn green-btn" onclick="newMatch()" style="flex:1;font-size:16px;padding:12px;max-width:none;margin:0;">🏏 Open New Match</button>
+        <button class="cta-btn red-btn" onclick="archiveMatch()" style="flex:1;font-size:16px;padding:12px;max-width:none;margin:0;">🔒 Close Match</button>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:10px;line-height:1.8;background:rgba(255,255,255,.02);padding:10px;border-radius:8px;">
+        <strong style="color:var(--gold);">Open New Match</strong> → clears players, increments match number, opens for registration.<br>
+        <strong style="color:var(--red);">Close Match</strong> → closes registration. Save results first.<br>
+        History updates automatically every time you <strong style="color:var(--gold);">Save Result</strong>.
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="admin-section">
+      <div class="admin-section-title">📅 Match Info</div>
+      <div class="form-group"><label class="form-label">Match Number</label><input class="form-input" id="a-match-number" type="number" placeholder="e.g. 12" min="1"></div>
+      <div class="form-group"><label class="form-label">Team 1</label><input class="form-input" id="a-team1" placeholder="e.g. MI"></div>
+      <div class="form-group"><label class="form-label">Team 2</label><input class="form-input" id="a-team2" placeholder="e.g. CSK"></div>
+      <div class="form-group"><label class="form-label">Match Time</label><input class="form-input" id="a-time" placeholder="e.g. 7:30 PM IST"></div>
+      <div class="form-group"><label class="form-label">Entry Fee (₹)</label><input class="form-input" id="a-fee" type="number" placeholder="50"></div>
+      <div class="form-group"><label class="form-label">Max Spots</label><input class="form-input" id="a-maxspots" type="number" placeholder="15"></div>
+      <button class="save-btn" onclick="saveMatch()">Save Match Info</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="admin-section">
+      <div class="admin-section-title">💳 Payment Settings</div>
+      <div class="form-group"><label class="form-label">QR Code Image URL</label><input class="form-input" id="a-qr" placeholder="https://... (your QR image link)"></div>
+      <div class="form-group"><label class="form-label">UPI Payment Link</label><input class="form-input" id="a-upi" placeholder="upi://pay?pa=yourname@bank&pn=Name&am=50"></div>
+      <button class="save-btn" onclick="savePayment()">Save Payment Info</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="admin-section">
+      <div class="admin-section-title">📱 Contest App Link</div>
+      <div class="form-group"><label class="form-label">Contest App Deep Link / URL</label><input class="form-input" id="a-contest" placeholder="e.g. dream11://... or https://..."></div>
+      <div class="form-group"><label class="form-label">Redirect Delay (seconds)</label><input class="form-input" id="a-redirect-delay" type="number" placeholder="3" min="0" max="10"></div>
+      <button class="save-btn" onclick="saveContest()">Save Contest Link</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="admin-section">
+      <div class="admin-section-title">🏆 Feed Match Result</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">Enter each player's Dream11 rank and prize money. Saving updates history automatically.</div>
+      <div id="result-feed-area"></div>
+      <div style="margin-top:16px;">
+        <div class="form-group">
+          <label class="form-label">Which team won the IPL match?</label>
+          <select class="form-input" id="a-winner">
+            <option value="">-- Pending / Not Announced --</option>
+            <option id="w-opt1" value="">Team 1</option>
+            <option id="w-opt2" value="">Team 2</option>
+          </select>
+        </div>
+      </div>
+      <button class="save-btn" onclick="saveResult()">💾 Save Result &amp; Update History</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="admin-section">
+      <div class="admin-section-title">👥 Registered Players (<span id="admin-player-count">0</span>)</div>
+      <div id="admin-player-list"></div>
+      <div class="divider"></div>
+      <button class="save-btn" onclick="clearPlayersOnly()" style="border-color:var(--red);color:var(--red);">🗑 Clear Players Only</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="admin-section">
+      <div class="admin-section-title">📜 Match History</div>
+      <div id="admin-history-list" style="font-size:13px;color:var(--muted);">Loading…</div>
+      <div class="divider"></div>
+      <button class="save-btn" onclick="clearHistory()" style="border-color:var(--muted);color:var(--muted);font-size:12px;padding:8px 16px;">🗑 Delete All History</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL -->
+<div class="modal-overlay" id="confirm-modal">
+  <div class="modal-box">
+    <div class="modal-icon">🔐</div>
+    <div class="modal-title" id="modal-title">Confirm Action</div>
+    <div class="modal-desc" id="modal-desc">Enter admin password to confirm.</div>
+    <input class="form-input modal-input" id="modal-pass-input" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')modalConfirm()">
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-confirm" id="modal-confirm-btn" onclick="modalConfirm()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
